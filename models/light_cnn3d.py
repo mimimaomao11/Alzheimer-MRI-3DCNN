@@ -7,7 +7,12 @@ Architecture:
     Stage1: ResBlock(16→16) + DownConv(16→32, stride=2) → (32, 32³)
     Stage2: ResBlock(32→32) + DownConv(32→64, stride=2) → (64, 16³)
     Stage3: ResBlock(64→64) + DownConv(64→128,stride=2) → (128, 8³)
-    Head  : GlobalAvgPool → Dropout(0.5) → Linear(128, 2)
+    Head  : GlobalAvgPool → [ClinicalMLP concat] → Dropout → Linear(128[+32], 2)
+
+When num_clinical > 0, a small MLP maps clinical features → 32-dim and
+concatenates with the image embedding before the final classifier.
+num_clinical=0 (default) is identical to the original architecture so
+old checkpoints load without modification.
 """
 from __future__ import annotations
 
@@ -46,7 +51,8 @@ class _DownConv3D(nn.Module):
 
 
 class LightCNN3D(nn.Module):
-    def __init__(self, num_classes: int = 2, dropout: float = 0.5) -> None:
+    def __init__(self, num_classes: int = 2, dropout: float = 0.5,
+                 num_clinical: int = 0) -> None:
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv3d(1, 16, kernel_size=7, stride=2, padding=3, bias=False),
@@ -58,10 +64,20 @@ class LightCNN3D(nn.Module):
         self.stage3 = nn.Sequential(_ResBlock3D(64, dropout=0.1), _DownConv3D(64, 128))
 
         self.pool = nn.AdaptiveAvgPool3d(1)
+        self.num_clinical = num_clinical
+
+        if num_clinical > 0:
+            self.clinical_mlp = nn.Sequential(
+                nn.Linear(num_clinical, 32),
+                nn.ReLU(inplace=True),
+                nn.Linear(32, 32),
+            )
+
+        head_in = 128 + (32 if num_clinical > 0 else 0)
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(p=dropout),
-            nn.Linear(128, num_classes),
+            nn.Linear(head_in, num_classes),
         )
         self._init_weights()
 
@@ -76,14 +92,25 @@ class LightCNN3D(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,
+                clinical: torch.Tensor | None = None) -> torch.Tensor:
         x = self.stem(x)
         x = self.stage1(x)
         x = self.stage2(x)
         x = self.stage3(x)
         x = self.pool(x)
+
+        if self.num_clinical > 0 and clinical is not None:
+            img_feat = x.flatten(1)                          # (B, 128)
+            clin_feat = self.clinical_mlp(clinical)          # (B, 32)
+            x = torch.cat([img_feat, clin_feat], dim=1)      # (B, 160)
+            x = self.classifier[1](x)                        # Dropout
+            return self.classifier[2](x)                     # Linear(160, 2)
+
         return self.classifier(x)
 
 
-def build_light_cnn3d(num_classes: int = 2, dropout: float = 0.5) -> LightCNN3D:
-    return LightCNN3D(num_classes=num_classes, dropout=dropout)
+def build_light_cnn3d(num_classes: int = 2, dropout: float = 0.5,
+                      num_clinical: int = 0) -> LightCNN3D:
+    return LightCNN3D(num_classes=num_classes, dropout=dropout,
+                      num_clinical=num_clinical)

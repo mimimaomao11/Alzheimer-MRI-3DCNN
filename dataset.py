@@ -15,6 +15,53 @@ from tqdm import tqdm
 LABEL_MAP = {"NC": 0, "AD": 1}
 MCI_LABEL_MAP = {"sMCI": 0, "pMCI": 1}
 
+# Clinical features pulled from ADNIMERGE baseline rows.
+CLINICAL_COLS: list[str] = ["AGE", "PTGENDER", "APOE4", "MMSE_bl", "CDRSB_bl"]
+
+
+def merge_clinical(df: pd.DataFrame, adnimerge_path: Path) -> pd.DataFrame:
+    """Left-join ADNIMERGE baseline clinical features into a scan-level DataFrame.
+
+    Matches on subject_id (scan df) == PTID (ADNIMERGE). PTGENDER is encoded
+    as Male=1 / Female=0. Missing values are filled with per-column medians
+    computed from the merged result.
+    """
+    adni = pd.read_csv(adnimerge_path, low_memory=False)
+
+    bl = adni[adni["VISCODE"] == "bl"].drop_duplicates("PTID", keep="first")
+    if bl.empty:
+        bl = adni.drop_duplicates("PTID", keep="first")
+
+    available = [c for c in CLINICAL_COLS if c in bl.columns]
+    bl = bl[["PTID"] + available].copy()
+
+    if "PTGENDER" in bl.columns:
+        bl["PTGENDER"] = (bl["PTGENDER"].str.strip().str.lower() == "male").astype(float)
+
+    merged = df.merge(bl, left_on="subject_id", right_on="PTID", how="left")
+    if "PTID" in merged.columns:
+        merged = merged.drop(columns=["PTID"])
+
+    n_missing = merged[available].isna().any(axis=1).sum()
+    if n_missing:
+        print(f"  [clinical] {n_missing}/{len(merged)} scans missing → filling with median")
+        for col in available:
+            merged[col] = merged[col].fillna(merged[col].median())
+
+    print(f"  [clinical] Merged {len(available)} features: {available}")
+    return merged
+
+
+def compute_clinical_stats(train_df: pd.DataFrame,
+                            cols: list[str]) -> dict[str, tuple[float, float]]:
+    """Compute per-feature (mean, std) from the training fold only."""
+    stats: dict[str, tuple[float, float]] = {}
+    for col in cols:
+        m = float(train_df[col].mean())
+        s = float(train_df[col].std(ddof=1))
+        stats[col] = (m, max(s, 1e-6))
+    return stats
+
 
 def filter_task_df(df: pd.DataFrame, task: str = "ad_nc") -> pd.DataFrame:
     if task == "ad_nc":
@@ -93,6 +140,8 @@ class ADNINpyDataset(Dataset):
         mean: Optional[float] = None,
         std: Optional[float] = None,
         preload: bool = False,
+        clinical_cols: Optional[list[str]] = None,
+        clinical_stats: Optional[dict[str, tuple[float, float]]] = None,
     ) -> None:
         if isinstance(csv_path, pd.DataFrame):
             self.df = filter_task_df(csv_path, task=task)
@@ -101,6 +150,8 @@ class ADNINpyDataset(Dataset):
         self.target_shape = target_shape
         self.augment = augment
         self.preload = preload
+        self.clinical_cols: list[str] = clinical_cols or []
+        self.clinical_stats: dict[str, tuple[float, float]] = clinical_stats or {}
 
         if mean is None or std is None:
             stats = load_norm_stats(norm_stats_path)
@@ -135,7 +186,7 @@ class ADNINpyDataset(Dataset):
         volume = volume + noise
         return volume.astype(np.float32)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int):
         row = self.df.iloc[index]
         if self._cache is not None:
             volume = self._cache[index].copy()
@@ -150,7 +201,20 @@ class ADNINpyDataset(Dataset):
         volume = (volume - self.mean) / self.std
         volume = np.ascontiguousarray(volume[None, ...], dtype=np.float32)
         label = int(row["label"])
-        return torch.from_numpy(volume), torch.tensor(label, dtype=torch.long)
+        img_tensor = torch.from_numpy(volume)
+        label_tensor = torch.tensor(label, dtype=torch.long)
+
+        if self.clinical_cols:
+            clin = np.zeros(len(self.clinical_cols), dtype=np.float32)
+            for i, col in enumerate(self.clinical_cols):
+                val = float(row[col]) if pd.notna(row[col]) else 0.0
+                if col in self.clinical_stats:
+                    m, s = self.clinical_stats[col]
+                    val = (val - m) / s
+                clin[i] = val
+            return img_tensor, torch.from_numpy(clin), label_tensor
+
+        return img_tensor, label_tensor
 
 
 def _tissue_maps(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

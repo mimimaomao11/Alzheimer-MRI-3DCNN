@@ -2,7 +2,7 @@
 
 使用 ADNI T1 結構式 MRI，以 LightCNN3D（~587K params）進行：
 1. **AD vs NC 二元分類**（AUC 0.751 ± 0.056）
-2. **pMCI vs sMCI 轉換預測**（AUC 0.744 ± 0.082）
+2. **pMCI vs sMCI 轉換預測**（AUC 0.763 ± 0.158，含臨床特徵融合）
 
 詳細方法與結果見 [docs/final_report.md](docs/final_report.md)。
 
@@ -31,7 +31,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```powershell
 # 1. Youden's J 最佳門檻評估
 .\.venv\Scripts\python.exe evaluate_youden.py --task ad_nc
-.\.venv\Scripts\python.exe evaluate_youden.py --task mci_conversion
+.\.venv\Scripts\python.exe evaluate_youden.py --task mci_conversion --adnimerge_csv dataset/ADNIMERGE.csv
 
 # 2. Grad-CAM 視覺化（含解剖切片）
 .\.venv\Scripts\python.exe visualize_gradcam.py --task ad_nc --anatomical
@@ -51,7 +51,14 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
     --output_csv results/cv_light_v4_results.csv \
     --epochs 150 --lr 1e-4 --focal_gamma 2.0 --ad_weight 1.0 --dropout 0.2
 
-# MCI 轉換（LightCNN3D）
+# MCI 轉換（LightCNN3D + 臨床特徵，v3）
+.\.venv\Scripts\python.exe train_mci_conversion.py \
+    --data_csv data/mci_conversion_list.csv \
+    --output_csv results/cv_mci_v3_results.csv \
+    --adnimerge_csv dataset/ADNIMERGE.csv \
+    --epochs 150 --lr 1e-4 --dropout 0.2 --pmci_weight 1.5
+
+# MCI 轉換（純影像，v2）
 .\.venv\Scripts\python.exe train_mci_conversion.py \
     --data_csv data/mci_conversion_list.csv \
     --output_csv results/cv_mci_v2_results.csv \
@@ -71,10 +78,21 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 ### Task 2：MCI 轉換（131 scans / 63 subjects）
 
+#### v2（純影像）
+
 | 方法 | AUC | Sensitivity | Specificity | 門檻 |
 |------|-----|-------------|-------------|------|
-| @0.5（初步篩查） | 0.744 | 0.771 | 0.298 | 0.5 |
-| **@Youden（確認診斷）** | **0.744** | **0.596** | **0.930** | **0.758** |
+| @0.5 | 0.744 | 0.771 | 0.298 | 0.5 |
+| @Youden | 0.744 | 0.596 | 0.930 | 0.758 |
+
+#### v3（影像 + 臨床特徵，推薦）
+
+| 方法 | AUC | Sensitivity | Specificity | 門檻 |
+|------|-----|-------------|-------------|------|
+| @0.5 | 0.763 | 1.000 | 0.134 | 0.5 |
+| **@Youden（推薦）** | **0.763** | **0.750** | **0.789** | **0.804** |
+
+臨床特徵：AGE、PTGENDER、APOE4、MMSE_bl、CDRSB_bl（來自 ADNIMERGE）
 
 ---
 
@@ -107,7 +125,9 @@ final projecet/
 │   ├── cv_light_v4_results.csv
 │   ├── cv_mci_v2_results.csv
 │   ├── youden_eval_adnc.csv
-│   └── youden_eval_mci.csv
+│   ├── youden_eval_mci.csv         ← v2 純影像
+│   ├── cv_mci_v3_results.csv       ← MCI v3（臨床特徵融合）
+│   └── youden_eval_mci_v3.csv      ← v3 Youden 評估
 │
 ├── docs/
 │   ├── final_report.md         ← ⭐ 完整結果報告

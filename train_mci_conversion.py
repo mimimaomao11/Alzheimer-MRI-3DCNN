@@ -15,7 +15,8 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from dataset import ADNINpyDataset, compute_norm_stats
+from dataset import (ADNINpyDataset, compute_norm_stats,
+                     CLINICAL_COLS, merge_clinical, compute_clinical_stats)
 from models.light_cnn3d import build_light_cnn3d
 
 
@@ -52,6 +53,7 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
+    use_clinical: bool = False,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     training = optimizer is not None
     model.train(training)
@@ -60,13 +62,20 @@ def run_epoch(
     all_probs: list[float] = []
 
     with torch.set_grad_enabled(training):
-        for images, labels in tqdm(loader, desc="Train" if training else "Val", leave=False):
+        for batch in tqdm(loader, desc="Train" if training else "Val", leave=False):
+            if use_clinical:
+                images, clinical, labels = batch
+                clinical = clinical.to(device, non_blocking=True)
+            else:
+                images, labels = batch
+                clinical = None
+
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             use_amp = scaler is not None and device.type == "cuda"
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                logits = model(images)
+                logits = model(images, clinical)
                 loss = criterion(logits, labels)
 
             if training:
@@ -127,14 +136,18 @@ def make_loaders(
     stats: dict,
     batch_size: int,
     preload: bool,
+    clinical_cols: list[str] | None = None,
+    clinical_stats: dict | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     train_ds = ADNINpyDataset(
         train_df, task="mci_conversion", augment=True,
         mean=float(stats["mean"]), std=float(stats["std"]), preload=preload,
+        clinical_cols=clinical_cols, clinical_stats=clinical_stats,
     )
     val_ds = ADNINpyDataset(
         val_df, task="mci_conversion", augment=False,
         mean=float(stats["mean"]), std=float(stats["std"]), preload=preload,
+        clinical_cols=clinical_cols, clinical_stats=clinical_stats,
     )
     pin = torch.cuda.is_available()
     return (
@@ -156,11 +169,21 @@ def train_one_fold(
     print(f"  Train pMCI/sMCI: {(train_df.group=='pMCI').sum()}/{(train_df.group=='sMCI').sum()}")
     print(f"  Val   pMCI/sMCI: {(val_df.group=='pMCI').sum()}/{(val_df.group=='sMCI').sum()}")
 
+    clinical_cols = CLINICAL_COLS if args.adnimerge_csv else []
+    clinical_stats = compute_clinical_stats(train_df, clinical_cols) if clinical_cols else {}
+    if clinical_cols:
+        print(f"  [clinical] Using {len(clinical_cols)} features: {clinical_cols}")
+
     stats_path = args.results_dir / f"norm_stats_mci_fold{fold}.json"
     stats = compute_norm_stats(train_df, stats_path, target_shape=(128, 128, 128), task="mci_conversion")
-    train_loader, val_loader = make_loaders(train_df, val_df, stats, args.batch_size, args.preload)
+    train_loader, val_loader = make_loaders(
+        train_df, val_df, stats, args.batch_size, args.preload,
+        clinical_cols=clinical_cols or None,
+        clinical_stats=clinical_stats or None,
+    )
 
-    model = build_light_cnn3d(num_classes=2, dropout=args.dropout_prob).to(device)
+    model = build_light_cnn3d(num_classes=2, dropout=args.dropout_prob,
+                               num_clinical=len(clinical_cols)).to(device)
 
     class_weight = torch.tensor([1.0, args.pmci_weight], dtype=torch.float32, device=device)
     print(f"Class weight: sMCI={class_weight[0].item():.2f}, pMCI={class_weight[1].item():.2f}")
@@ -186,9 +209,12 @@ def train_one_fold(
         ])
         writer.writeheader()
 
+        use_clinical = len(clinical_cols) > 0
         for epoch in range(1, args.epochs + 1):
-            train_loss, _, _ = run_epoch(model, train_loader, criterion, device, optimizer, scaler)
-            val_loss, val_labels, val_probs = run_epoch(model, val_loader, criterion, device)
+            train_loss, _, _ = run_epoch(model, train_loader, criterion, device,
+                                         optimizer, scaler, use_clinical=use_clinical)
+            val_loss, val_labels, val_probs = run_epoch(model, val_loader, criterion, device,
+                                                        use_clinical=use_clinical)
             metrics = compute_metrics(val_labels, val_probs)
             lr = optimizer.param_groups[0]["lr"]
 
@@ -222,6 +248,9 @@ def train_one_fold(
                     "label_map": {"sMCI": 0, "pMCI": 1},
                     "target_shape": (128, 128, 128),
                     "model_name": "LightCNN3D_MCI",
+                    "num_clinical": len(clinical_cols),
+                    "clinical_cols": clinical_cols,
+                    "clinical_stats": clinical_stats,
                 }, ckpt_path)
                 print(f"  -> Saved (val_auc={best_val_auc:.6f})")
             else:
@@ -278,6 +307,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_delta", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--preload", action="store_true", default=True)
+    parser.add_argument("--adnimerge_csv", type=Path, default=None,
+                        help="Path to ADNIMERGE.csv; enables clinical feature fusion")
     return parser.parse_args()
 
 
@@ -295,6 +326,10 @@ def main() -> int:
         raise ValueError(f"No pMCI/sMCI rows in {args.data_csv}")
     if "subject_id" not in df.columns:
         raise ValueError("'subject_id' column missing.")
+
+    if args.adnimerge_csv:
+        print(f"Merging clinical features from {args.adnimerge_csv}")
+        df = merge_clinical(df, args.adnimerge_csv)
 
     labels = df["label"].to_numpy()
     groups = df["subject_id"].to_numpy()

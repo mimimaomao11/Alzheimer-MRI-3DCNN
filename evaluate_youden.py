@@ -21,7 +21,7 @@ from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import ADNINpyDataset, filter_task_df
+from dataset import ADNINpyDataset, filter_task_df, merge_clinical
 from models.light_cnn3d import build_light_cnn3d
 
 
@@ -54,19 +54,30 @@ def run_inference(
     batch_size: int,
     device: torch.device,
     task: str,
+    clinical_cols: list[str] | None = None,
+    clinical_stats: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     val_ds = ADNINpyDataset(
         val_df, task=task, augment=False,
         mean=float(norm_stats["mean"]), std=float(norm_stats["std"]),
         preload=False,
+        clinical_cols=clinical_cols,
+        clinical_stats=clinical_stats,
     )
     loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
     model.eval()
     all_labels, all_probs = [], []
+    use_clinical = bool(clinical_cols)
     with torch.no_grad():
-        for images, labels in tqdm(loader, desc="Inference", leave=False):
+        for batch in tqdm(loader, desc="Inference", leave=False):
+            if use_clinical:
+                images, clinical, labels = batch
+                clinical = clinical.to(device)
+            else:
+                images, labels = batch
+                clinical = None
             images = images.to(device)
-            logits = model(images)
+            logits = model(images, clinical)
             probs = torch.softmax(logits, dim=1)[:, 1]
             all_labels.extend(labels.numpy().tolist())
             all_probs.extend(probs.cpu().numpy().tolist())
@@ -206,7 +217,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_splits",  type=int,   default=5)
     p.add_argument("--seed",      type=int,   default=42)
     p.add_argument("--batch_size",type=int,   default=4)
-    p.add_argument("--output_csv",type=Path,  default=None)
+    p.add_argument("--output_csv",     type=Path, default=None)
+    p.add_argument("--adnimerge_csv",  type=Path, default=None,
+                   help="Required when evaluating checkpoints trained with clinical features")
     return p.parse_args()
 
 
@@ -241,11 +254,16 @@ def main() -> None:
     labels  = df["label"].to_numpy()
     groups  = df["subject_id"].to_numpy()
 
+    # Pre-merge clinical features once if adnimerge_csv is provided
+    df_clinical: pd.DataFrame | None = None
+    if args.adnimerge_csv and args.adnimerge_csv.exists():
+        print(f"Pre-merging clinical features from {args.adnimerge_csv}")
+        df_clinical = merge_clinical(df, args.adnimerge_csv)
+
     kf = StratifiedGroupKFold(n_splits=args.n_splits, shuffle=True, random_state=args.seed)
     fold_results = []
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(df, labels, groups=groups), start=1):
-        val_df = df.iloc[val_idx].reset_index(drop=True)
         ckpt_path = args.checkpoint_dir / f"{ckpt_prefix}{fold}.pth"
 
         if not ckpt_path.exists():
@@ -253,19 +271,33 @@ def main() -> None:
             continue
 
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        norm_stats  = ckpt["norm_stats"]
-        target_shape = ckpt.get("target_shape", (128, 128, 128))
+        norm_stats   = ckpt["norm_stats"]
         best_epoch   = ckpt.get("epoch", "?")
+        num_clinical = ckpt.get("num_clinical", 0)
+        clinical_cols  = ckpt.get("clinical_cols", []) if num_clinical > 0 else []
+        clinical_stats = ckpt.get("clinical_stats", {}) if num_clinical > 0 else {}
 
         print(f"\n[Fold {fold}] checkpoint epoch={best_epoch}, "
-              f"stored_auc={ckpt.get('best_val_auc', float('nan')):.4f}")
+              f"stored_auc={ckpt.get('best_val_auc', float('nan')):.4f}"
+              + (f", clinical={len(clinical_cols)} features" if clinical_cols else ""))
 
-        # Build and load model
-        model = build_light_cnn3d(num_classes=2, dropout=0.0).to(device)
+        # Use clinical-merged df if the checkpoint was trained with clinical features
+        if clinical_cols and df_clinical is not None:
+            val_df = df_clinical.iloc[val_idx].reset_index(drop=True)
+        else:
+            val_df = df.iloc[val_idx].reset_index(drop=True)
+            clinical_cols = []
+            clinical_stats = {}
+
+        model = build_light_cnn3d(num_classes=2, dropout=0.0,
+                                   num_clinical=num_clinical).to(device)
         model.load_state_dict(ckpt["model_state_dict"])
 
         val_labels, val_probs = run_inference(
-            model, val_df, norm_stats, args.batch_size, device, args.task)
+            model, val_df, norm_stats, args.batch_size, device, args.task,
+            clinical_cols=clinical_cols or None,
+            clinical_stats=clinical_stats or None,
+        )
 
         m = compute_full_metrics(val_labels, val_probs)
         m["fold"] = fold
