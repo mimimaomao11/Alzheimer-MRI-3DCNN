@@ -1,0 +1,36 @@
+# ── ADNI patient data (not to be redistributed per ADNI DUA) ──────────────
+data/processed/
+dataset/
+adni_metadata.csv
+data/subject_list.csv
+data/quality_report.csv
+
+# Scan lists contain ADNI subject IDs — excluded per DUA.
+data/processed_list.csv
+data/mci_conversion_list.csv
+
+# ── Model checkpoints ─────────────────────────────────────────────────────
+# Included: best_light.pth, best_mci.pth, best_baseline*.pth
+# Excluded: per-fold LightCNN3D weights (upload to GitHub Releases as zip)
+checkpoints/best_light_fold[1-5].pth
+checkpoints/best_mci_fold[1-5].pth
+
+# ── Claude Code session files ──────────────────────────────────────────────
+.claude/
+
+# ── Python environment & cache ─────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── Jupyter / IDE ──────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# ── OS noise ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
