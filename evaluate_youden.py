@@ -47,6 +47,16 @@ def load_mci_df(csv_path: Path) -> pd.DataFrame:
 # Inference
 # ---------------------------------------------------------------------------
 
+def _tta_flip(images: torch.Tensor, aug_idx: int) -> torch.Tensor:
+    """Apply one of 8 flip combinations to a batch of 3D volumes.
+
+    aug_idx is a 3-bit mask: bit0=flip D, bit1=flip H, bit2=flip W.
+    aug_idx=0 is the identity (no flip).
+    """
+    dims = [d for d, bit in zip([2, 3, 4], [1, 2, 4]) if aug_idx & bit]
+    return torch.flip(images, dims=dims) if dims else images
+
+
 def run_inference(
     model: torch.nn.Module,
     val_df: pd.DataFrame,
@@ -56,6 +66,7 @@ def run_inference(
     task: str,
     clinical_cols: list[str] | None = None,
     clinical_stats: dict | None = None,
+    n_tta: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     val_ds = ADNINpyDataset(
         val_df, task=task, augment=False,
@@ -68,6 +79,7 @@ def run_inference(
     model.eval()
     all_labels, all_probs = [], []
     use_clinical = bool(clinical_cols)
+    n_tta = max(1, min(n_tta, 8))
     with torch.no_grad():
         for batch in tqdm(loader, desc="Inference", leave=False):
             if use_clinical:
@@ -77,8 +89,13 @@ def run_inference(
                 images, labels = batch
                 clinical = None
             images = images.to(device)
-            logits = model(images, clinical)
-            probs = torch.softmax(logits, dim=1)[:, 1]
+            prob_sum = None
+            for aug_idx in range(n_tta):
+                aug_images = _tta_flip(images, aug_idx)
+                logits = model(aug_images, clinical)
+                p = torch.softmax(logits, dim=1)[:, 1]
+                prob_sum = p if prob_sum is None else prob_sum + p
+            probs = prob_sum / n_tta
             all_labels.extend(labels.numpy().tolist())
             all_probs.extend(probs.cpu().numpy().tolist())
     return np.asarray(all_labels), np.asarray(all_probs)
@@ -220,6 +237,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_csv",     type=Path, default=None)
     p.add_argument("--adnimerge_csv",  type=Path, default=None,
                    help="Required when evaluating checkpoints trained with clinical features")
+    p.add_argument("--tta", type=int, default=1, metavar="N",
+                   help="Test-Time Augmentation: number of flip variants to average (1=off, 8=all flips)")
     return p.parse_args()
 
 
@@ -240,6 +259,7 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Task:   {args.task}")
     print(f"CSV:    {args.data_csv}")
+    print(f"TTA:    {args.tta} augmentation(s)")
 
     # Load and filter DataFrame
     if args.task == "ad_nc":
@@ -297,6 +317,7 @@ def main() -> None:
             model, val_df, norm_stats, args.batch_size, device, args.task,
             clinical_cols=clinical_cols or None,
             clinical_stats=clinical_stats or None,
+            n_tta=args.tta,
         )
 
         m = compute_full_metrics(val_labels, val_probs)
